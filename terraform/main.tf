@@ -5,7 +5,7 @@ data "vault_generic_secret" "rds" {
 
 # VPC Configuration
 module "vpc" {
-  source                = "../../modules/vpc/vpc"
+  source                = "./modules/vpc/vpc"
   vpc_name              = "vpc"
   vpc_cidr_block        = "10.0.0.0/16"
   enable_dns_hostnames  = true
@@ -13,9 +13,35 @@ module "vpc" {
   internet_gateway_name = "vpc_igw"
 }
 
+# RDS Security Group
+module "rds_sg" {
+  source = "./modules/vpc/security_groups"
+  vpc_id = module.vpc.vpc_id
+  name   = "rds_sg"
+  ingress = [
+    {
+      from_port       = 3306
+      to_port         = 3306
+      protocol        = "tcp"
+      self            = "false"
+      cidr_blocks     = ["0.0.0.0/0"]
+      security_groups = []
+      description     = "any"
+    }
+  ]
+  egress = [
+    {
+      from_port   = 0
+      to_port     = 0
+      protocol    = "-1"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  ]
+}
+
 # Public Subnets
 module "public_subnets" {
-  source = "../../modules/vpc/subnets"
+  source = "./modules/vpc/subnets"
   name   = "public subnet"
   subnets = [
     {
@@ -37,7 +63,7 @@ module "public_subnets" {
 
 # Private Subnets
 module "private_subnets" {
-  source = "../../modules/vpc/subnets"
+  source = "./modules/vpc/subnets"
   name   = "private subnet"
   subnets = [
     {
@@ -59,7 +85,7 @@ module "private_subnets" {
 
 # Public Route Table
 module "public_rt" {
-  source  = "../../modules/vpc/route_tables"
+  source  = "./modules/vpc/route_tables"
   name    = "public route table"
   subnets = module.public_subnets.subnets[*]
   routes = [
@@ -74,18 +100,18 @@ module "public_rt" {
 
 # Private Route Table
 module "private_rt" {
-  source  = "../../modules/vpc/route_tables"
+  source  = "./modules/vpc/route_tables"
   name    = "public route table"
   subnets = module.private_subnets.subnets[*]
-  routes = []
-  vpc_id = module.vpc.vpc_id
+  routes  = []
+  vpc_id  = module.vpc.vpc_id
 }
 
 # Secrets Manager
 module "db_credentials" {
-  source                  = "../../modules/secrets-manager"
-  name                    = "rds_secrets_${var.env}"
-  description             = "rds_secrets_${var.env}"
+  source                  = "./modules/secrets-manager"
+  name                    = "rds_secret"
+  description             = "rds_secret"
   recovery_window_in_days = 0
   secret_string = jsonencode({
     username = tostring(data.vault_generic_secret.rds.data["username"])
@@ -95,23 +121,84 @@ module "db_credentials" {
 
 # Lambda Layer for storing dependencies
 resource "aws_lambda_layer_version" "python_layer" {
-  filename            = "../../files/python.zip"
+  filename            = "./files/psycopg2_layer.zip"
   layer_name          = "psycopg2_layer"
   compatible_runtimes = ["python3.12"]
+}
+
+# MediaConvert Get Records Function Code Bucket
+module "lambda_function_code" {
+  source      = "./modules/s3"
+  bucket_name = "etllambdafunctioncodebucketmadmax"
+  objects = [
+    {
+      key    = "lambda.zip"
+      source = "./files/lambda.zip"
+    }
+  ]
+  versioning_enabled = "Enabled"
+  cors = [
+    {
+      allowed_headers = ["*"]
+      allowed_methods = ["PUT", "POST", "GET"]
+      allowed_origins = ["*"]
+      max_age_seconds = 3000
+    }
+  ]
+  force_destroy = true
+}
+
+module "lambda_function_role" {
+  source             = "./modules/iam"
+  role_name          = "lambda_function_role"
+  role_description   = "lambda_function_role"
+  policy_name        = "lambda_function_iam_policy"
+  policy_description = "lambda_function_iam_policy"
+  assume_role_policy = <<EOF
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Action": "sts:AssumeRole",
+          "Principal": {
+            "Service": "lambda.amazonaws.com"
+          },
+          "Effect": "Allow",
+          "Sid": ""
+        }
+      ]
+    }
+    EOF
+  policy             = <<EOF
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+       {
+          "Action": [
+            "logs:CreateLogGroup",
+            "logs:CreateLogStream",
+            "logs:PutLogEvents"
+          ],
+          "Resource": ["arn:aws:logs:*:*:*"],
+          "Effect": "Allow"
+       } 
+      ]
+    }
+    EOF
 }
 
 # Lambda function to update data in RDS database
 module "lambda_function" {
   source        = "./modules/lambda"
   function_name = "lambda_function"
-  role_arn      = module.carshub_media_update_function_iam_role.arn
+  role_arn      = module.lambda_function_role.role_arn
   permissions   = []
   env_variables = {}
-  handler   = "lambda.lambda_handler"
-  runtime   = "python3.12"
-  s3_bucket = module.carshub_media_update_function_code.bucket
-  s3_key    = "lambda.zip"
-  layers    = [aws_lambda_layer_version.python_layer.arn]
+  handler       = "lambda.lambda_handler"
+  runtime       = "python3.12"
+  s3_bucket     = module.lambda_function_code.bucket
+  s3_key        = "lambda.zip"
+  layers        = [aws_lambda_layer_version.python_layer.arn]
 }
 
 # RDS Instance
@@ -130,9 +217,9 @@ module "db" {
   backup_retention_period = 7
   backup_window           = "03:00-05:00"
   subnet_group_ids = [
-    module.carshub_public_subnets.subnets[0].id,
-    module.carshub_public_subnets.subnets[1].id,
-    module.carshub_public_subnets.subnets[2].id
+    module.public_subnets.subnets[0].id,
+    module.public_subnets.subnets[1].id,
+    module.public_subnets.subnets[2].id
   ]
   vpc_security_group_ids = [module.rds_sg.id]
   publicly_accessible    = false
@@ -141,9 +228,9 @@ module "db" {
 
 # Destination S3 Bucket
 module "destination_bucket" {
-  source      = "./modules/s3"
-  bucket_name = "etldestinationbucketmadmax"
-  objects = []
+  source             = "./modules/s3"
+  bucket_name        = "etldestinationbucketmadmax"
+  objects            = []
   versioning_enabled = "Enabled"
   cors = [
     {
